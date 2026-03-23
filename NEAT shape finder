@@ -1,0 +1,777 @@
+# neat_optimize.py
+#
+# NEAT to find the optimal network shape for Pong AI.
+# CONSTRAINED to shapes that fit in 256 bytes of NVM.
+#
+# Run on your PC:   python neat_optimize.py
+#
+# Requires: Python 3, numpy
+
+import numpy as np
+import random
+import time
+import multiprocessing as mp
+from copy import deepcopy
+
+SCREEN = 240
+PADDLE_W = 60
+BALL_RADIUS = 5
+N_INPUTS = 6
+N_OUTPUTS = 1
+NVM_MAX_BYTES = 256
+
+
+def nvm_bytes_for_genome(genome):
+    """Calculate how many NVM bytes a genome's dense shape would need."""
+    dense = genome.get_dense_shape()
+    # Header: 1 magic + 1 n_shape + len(dense) shape ints + 2 n_values
+    header = 1 + 1 + len(dense) + 2
+    params = 0
+    for i in range(len(dense) - 1):
+        params += dense[i] * dense[i + 1] + dense[i + 1]
+    return header + params * 4
+
+
+# ================================================================== #
+#  NEAT Gene Representation
+# ================================================================== #
+
+class NodeGene:
+    INPUT = 0
+    HIDDEN = 1
+    OUTPUT = 2
+
+    def __init__(self, node_id, node_type, layer=0):
+        self.id = node_id
+        self.type = node_type
+        self.layer = layer
+
+
+class ConnectionGene:
+    def __init__(self, in_node, out_node, weight, innovation, enabled=True):
+        self.in_node = in_node
+        self.out_node = out_node
+        self.weight = weight
+        self.innovation = innovation
+        self.enabled = enabled
+
+
+class InnovationTracker:
+    def __init__(self):
+        self.current = 0
+        self.history = {}
+
+    def get(self, in_node, out_node):
+        key = (in_node, out_node)
+        if key not in self.history:
+            self.history[key] = self.current
+            self.current += 1
+        return self.history[key]
+
+
+# ================================================================== #
+#  Genome
+# ================================================================== #
+
+class Genome:
+    def __init__(self, tracker):
+        self.tracker = tracker
+        self.nodes = {}
+        self.connections = {}
+        self.fitness = 0.0
+        self.next_node_id = 0
+        self._matrix_cache = None
+        self._fitness_valid = False
+
+    def create_minimal(self):
+        for i in range(N_INPUTS):
+            self.nodes[self.next_node_id] = NodeGene(
+                self.next_node_id, NodeGene.INPUT, 0)
+            self.next_node_id += 1
+
+        out_id = self.next_node_id
+        self.nodes[out_id] = NodeGene(out_id, NodeGene.OUTPUT, 1)
+        self.next_node_id += 1
+
+        for i in range(N_INPUTS):
+            innov = self.tracker.get(i, out_id)
+            self.connections[innov] = ConnectionGene(
+                i, out_id, random.uniform(-1.0, 1.0), innov)
+        self._invalidate()
+
+    def normalize_layers(self):
+        unique = sorted(set(n.layer for n in self.nodes.values()))
+        mapping = {l: i for i, l in enumerate(unique)}
+        for n in self.nodes.values():
+            n.layer = mapping[n.layer]
+
+    def _invalidate(self):
+        self._matrix_cache = None
+        self._fitness_valid = False
+
+    def _build_matrices(self):
+        layer_nodes = {}
+        for node in self.nodes.values():
+            layer_nodes.setdefault(node.layer, []).append(node)
+
+        sorted_layers = sorted(layer_nodes.keys())
+        node_to_idx = {}
+        layer_sizes = []
+        for l in sorted_layers:
+            nodes_in_layer = sorted(layer_nodes[l], key=lambda n: n.id)
+            for idx, node in enumerate(nodes_in_layer):
+                node_to_idx[node.id] = (l, idx)
+            layer_sizes.append(len(nodes_in_layer))
+
+        matrices = []
+        for li in range(1, len(sorted_layers)):
+            curr_layer = sorted_layers[li]
+            curr_size = layer_sizes[li]
+            prev_total = sum(layer_sizes[j] for j in range(li))
+            W = np.zeros((curr_size, prev_total))
+
+            for conn in self.connections.values():
+                if not conn.enabled:
+                    continue
+                if conn.out_node not in node_to_idx:
+                    continue
+                out_layer, out_idx = node_to_idx[conn.out_node]
+                if out_layer != curr_layer:
+                    continue
+                if conn.in_node not in node_to_idx:
+                    continue
+                in_layer, in_idx = node_to_idx[conn.in_node]
+                in_layer_order = sorted_layers.index(in_layer)
+                if in_layer_order >= li:
+                    continue
+                global_idx = sum(layer_sizes[j] for j in range(in_layer_order)) + in_idx
+                W[out_idx, global_idx] = conn.weight
+
+            matrices.append(W)
+
+        self._matrix_cache = {
+            "layer_sizes": layer_sizes,
+            "matrices": matrices,
+        }
+
+    def forward(self, inputs):
+        if self._matrix_cache is None:
+            self._build_matrices()
+
+        cache = self._matrix_cache
+        layer_sizes = cache["layer_sizes"]
+        matrices = cache["matrices"]
+
+        activations = [np.array(inputs[:layer_sizes[0]])]
+
+        for W in matrices:
+            prev = np.concatenate(activations)
+            z = W @ prev
+            z = np.clip(z, -10.0, 10.0)
+            a = 1.0 / (1.0 + np.exp(-z))
+            activations.append(a)
+
+        output = activations[-1]
+        return float(output[0]) if len(output) > 0 else 0.5
+
+    def mutate(self):
+        self._invalidate()
+
+        if random.random() < 0.8:
+            for conn in self.connections.values():
+                if random.random() < 0.9:
+                    conn.weight += random.gauss(0, 0.3)
+                    conn.weight = max(-3.0, min(3.0, conn.weight))
+                else:
+                    conn.weight = random.uniform(-1.0, 1.0)
+
+        if random.random() < 0.15:
+            self._mutate_add_connection()
+
+        # Only add a node if the result would still fit in NVM
+        if random.random() < 0.05:
+            self._mutate_add_node_if_fits()
+
+        if random.random() < 0.03 and self.connections:
+            conn = random.choice(list(self.connections.values()))
+            conn.enabled = not conn.enabled
+
+    def _mutate_add_connection(self):
+        nodes = list(self.nodes.values())
+        attempts = 0
+        while attempts < 100:
+            n1 = random.choice(nodes)
+            n2 = random.choice(nodes)
+
+            if n1.layer >= n2.layer:
+                n1, n2 = n2, n1
+            if n1.layer >= n2.layer:
+                attempts += 1
+                continue
+            if n2.type == NodeGene.INPUT:
+                attempts += 1
+                continue
+
+            exists = any(
+                c.in_node == n1.id and c.out_node == n2.id
+                for c in self.connections.values()
+            )
+
+            if not exists:
+                innov = self.tracker.get(n1.id, n2.id)
+                self.connections[innov] = ConnectionGene(
+                    n1.id, n2.id, random.uniform(-1.0, 1.0), innov)
+                return
+
+            attempts += 1
+
+    def _mutate_add_node_if_fits(self):
+        """Only add a node if the resulting dense shape fits in NVM."""
+        enabled = [c for c in self.connections.values() if c.enabled]
+        if not enabled:
+            return
+
+        conn = random.choice(enabled)
+
+        # Temporarily add the node and check size
+        conn.enabled = False
+        new_id = self.next_node_id
+
+        in_layer = self.nodes[conn.in_node].layer
+        out_layer = self.nodes[conn.out_node].layer
+        new_layer = (in_layer + out_layer) / 2.0
+
+        self.nodes[new_id] = NodeGene(new_id, NodeGene.HIDDEN, new_layer)
+        self.next_node_id += 1
+
+        innov1 = self.tracker.get(conn.in_node, new_id)
+        self.connections[innov1] = ConnectionGene(
+            conn.in_node, new_id, 1.0, innov1)
+
+        innov2 = self.tracker.get(new_id, conn.out_node)
+        self.connections[innov2] = ConnectionGene(
+            new_id, conn.out_node, conn.weight, innov2)
+
+        self.normalize_layers()
+
+        # Check if it fits
+        if nvm_bytes_for_genome(self) > NVM_MAX_BYTES:
+            # Revert: remove the node and connections, re-enable original
+            del self.nodes[new_id]
+            if innov1 in self.connections:
+                del self.connections[innov1]
+            if innov2 in self.connections:
+                del self.connections[innov2]
+            conn.enabled = True
+            self.next_node_id -= 1
+            self.normalize_layers()
+
+    def complexity(self):
+        n_conn = sum(1 for c in self.connections.values() if c.enabled)
+        n_hid = sum(1 for n in self.nodes.values() if n.type == NodeGene.HIDDEN)
+        return n_conn + n_hid
+
+    def get_shape_summary(self):
+        layers = {}
+        for n in self.nodes.values():
+            layers[n.layer] = layers.get(n.layer, 0) + 1
+        shape = [layers[l] for l in sorted(layers)]
+        n_conn = sum(1 for c in self.connections.values() if c.enabled)
+        n_hidden = sum(1 for n in self.nodes.values() if n.type == NodeGene.HIDDEN)
+        return shape, n_hidden, n_conn
+
+    def get_dense_shape(self):
+        layers = {}
+        for node in self.nodes.values():
+            if node.type == NodeGene.HIDDEN:
+                layers[node.layer] = layers.get(node.layer, 0) + 1
+        sorted_hidden = sorted(layers.keys())
+        return [N_INPUTS] + [layers[l] for l in sorted_hidden] + [N_OUTPUTS]
+
+
+# ================================================================== #
+#  Crossover
+# ================================================================== #
+
+def crossover(p1, p2, tracker):
+    child = Genome(tracker)
+    child.next_node_id = max(p1.next_node_id, p2.next_node_id)
+
+    for nid, node in p1.nodes.items():
+        child.nodes[nid] = NodeGene(node.id, node.type, node.layer)
+
+    for nid, node in p2.nodes.items():
+        if nid not in child.nodes:
+            child.nodes[nid] = NodeGene(node.id, node.type, node.layer)
+
+    all_innov = set(p1.connections) | set(p2.connections)
+
+    for i in all_innov:
+        if i in p1.connections and i in p2.connections:
+            src = p1.connections[i] if random.random() < 0.5 else p2.connections[i]
+        elif i in p1.connections:
+            src = p1.connections[i]
+        else:
+            if random.random() < 0.3:
+                src = p2.connections[i]
+            else:
+                continue
+
+        child.connections[i] = ConnectionGene(
+            src.in_node, src.out_node, src.weight,
+            src.innovation, src.enabled)
+
+    # If child exceeds NVM, prune hidden nodes until it fits
+    while nvm_bytes_for_genome(child) > NVM_MAX_BYTES:
+        hidden = [n for n in child.nodes.values() if n.type == NodeGene.HIDDEN]
+        if not hidden:
+            break
+        # Remove the most recently added hidden node
+        remove = max(hidden, key=lambda n: n.id)
+        # Disable connections to/from this node
+        for conn in child.connections.values():
+            if conn.in_node == remove.id or conn.out_node == remove.id:
+                conn.enabled = False
+        del child.nodes[remove.id]
+        child.normalize_layers()
+
+    return child
+
+
+# ================================================================== #
+#  Compatibility distance
+# ================================================================== #
+
+def compatibility_distance(g1, g2, c1=1.0, c2=0.5, c3=0.4):
+    innov1 = set(g1.connections)
+    innov2 = set(g2.connections)
+
+    matching = innov1 & innov2
+    non_matching = innov1 ^ innov2
+
+    max_innov1 = max(innov1, default=0)
+    max_innov2 = max(innov2, default=0)
+    max_shared = min(max_innov1, max_innov2)
+
+    excess = 0
+    disjoint = 0
+    for i in non_matching:
+        if i > max_shared:
+            excess += 1
+        else:
+            disjoint += 1
+
+    n = max(len(innov1), len(innov2), 1)
+
+    if matching:
+        w_diff = sum(
+            abs(g1.connections[i].weight - g2.connections[i].weight)
+            for i in matching
+        ) / len(matching)
+    else:
+        w_diff = 0.0
+
+    return c1 * excess / n + c2 * disjoint / n + c3 * w_diff
+
+
+# ================================================================== #
+#  Species
+# ================================================================== #
+
+class Species:
+    def __init__(self, representative):
+        self.representative = representative
+        self.members = [representative]
+        self.best_fitness = 0.0
+        self.stagnation = 0
+
+    def is_compatible(self, genome, threshold=3.0):
+        return compatibility_distance(self.representative, genome) < threshold
+
+
+# ================================================================== #
+#  Pong Simulation
+# ================================================================== #
+
+class SimBall:
+    def __init__(self):
+        self.radius = BALL_RADIUS
+        self.reset()
+
+    def reset(self):
+        self.x = SCREEN / 2.0
+        self.y = SCREEN / 2.0
+        self.vx = random.choice([-0.5, 0.5])
+        self.vy = random.choice([-0.5, 0.5])
+
+    def deflect(self, paddle_x):
+        centre = paddle_x + PADDLE_W / 2
+        offset = (self.x - centre) / (PADDLE_W / 2)
+        offset = max(-1.0, min(1.0, offset))
+        self.vx = offset * 0.8
+
+    def step(self, p1_x, p2_x):
+        self.x += self.vx * self.radius
+        self.y += self.vy * self.radius
+
+        if self.x < self.radius:
+            self.x = self.radius; self.vx = -self.vx
+        if self.x > SCREEN - self.radius:
+            self.x = SCREEN - self.radius; self.vx = -self.vx
+
+        if self.y < self.radius:
+            return "WIN"
+        if self.y > SCREEN - self.radius:
+            return "LOSE"
+
+        if (self.vy > 0 and
+            228 <= self.y + self.radius <= 230 and
+            p1_x <= self.x <= p1_x + PADDLE_W):
+            self.vy = -self.vy
+            self.y = 228 - self.radius
+            self.deflect(p1_x)
+            return "HIT_BOTTOM"
+
+        if (self.vy < 0 and
+            12 <= self.y - self.radius <= 14 and
+            p2_x <= self.x <= p2_x + PADDLE_W):
+            self.vy = -self.vy
+            self.y = 14 + self.radius
+            self.deflect(p2_x)
+            return "HIT_TOP"
+
+        return None
+
+
+def build_inputs(bx, by, bvx, bvy, px):
+    pc = px + PADDLE_W / 2
+    offset = (bx - pc) / (PADDLE_W / 2)
+    offset = max(-1.0, min(1.0, offset))
+    return [bx / SCREEN, by / SCREEN, bvx, bvy, pc / SCREEN, offset]
+
+
+# ================================================================== #
+#  Fitness evaluation
+# ================================================================== #
+
+def _evaluate_single(genome, n_games=5, max_frames=2000):
+    total_hits = 0
+
+    for _ in range(n_games):
+        ball = SimBall()
+        p1 = SCREEN / 2 - PADDLE_W / 2
+        p2 = SCREEN / 2 - PADDLE_W / 2
+
+        for __ in range(max_frames):
+            diff = ball.x - (p1 + PADDLE_W / 2)
+            if abs(diff) > 2:
+                p1 += 1.5 if diff > 0 else -1.5
+            p1 = max(0, min(SCREEN - PADDLE_W, p1))
+
+            inputs = build_inputs(ball.x, ball.y, ball.vx, ball.vy, p2)
+            out = genome.forward(inputs)
+            if out < 0.45:
+                p2 -= 1.5
+            elif out > 0.55:
+                p2 += 1.5
+            p2 = max(0, min(SCREEN - PADDLE_W, p2))
+
+            result = ball.step(p1, p2)
+
+            if result == "HIT_TOP":
+                total_hits += 1
+            elif result in ("WIN", "LOSE"):
+                ball.reset()
+
+    fitness = total_hits - genome.complexity() * 0.1
+    return max(0.0, fitness)
+
+
+def _evaluate_thorough(genome, n_games=20, max_frames=4000):
+    total_hits = 0
+    total_misses = 0
+
+    for _ in range(n_games):
+        ball = SimBall()
+        p1 = SCREEN / 2 - PADDLE_W / 2
+        p2 = SCREEN / 2 - PADDLE_W / 2
+
+        for __ in range(max_frames):
+            diff = ball.x - (p1 + PADDLE_W / 2)
+            if abs(diff) > 2:
+                p1 += 1.5 if diff > 0 else -1.5
+            p1 = max(0, min(SCREEN - PADDLE_W, p1))
+
+            inputs = build_inputs(ball.x, ball.y, ball.vx, ball.vy, p2)
+            out = genome.forward(inputs)
+            if out < 0.45:
+                p2 -= 1.5
+            elif out > 0.55:
+                p2 += 1.5
+            p2 = max(0, min(SCREEN - PADDLE_W, p2))
+
+            result = ball.step(p1, p2)
+
+            if result == "HIT_TOP":
+                total_hits += 1
+            elif result == "WIN":
+                total_misses += 1
+                ball.reset()
+            elif result == "LOSE":
+                ball.reset()
+
+    return total_hits, total_misses
+
+
+def evaluate_population(population, pool):
+    to_eval = []
+    indices = []
+
+    for i, g in enumerate(population):
+        if not g._fitness_valid:
+            to_eval.append(g)
+            indices.append(i)
+
+    if to_eval:
+        results = pool.map(_evaluate_single, to_eval)
+        for idx, fitness in zip(indices, results):
+            population[idx].fitness = fitness
+            population[idx]._fitness_valid = True
+
+
+# ================================================================== #
+#  NEAT main loop
+# ================================================================== #
+
+def run_neat(pop_size=150, generations=150, stagnation_limit=30):
+    tracker = InnovationTracker()
+
+    population = []
+    for _ in range(pop_size):
+        g = Genome(tracker)
+        g.create_minimal()
+        g.mutate()
+        population.append(g)
+
+    species_list = []
+    best_ever = None
+    best_fitness_ever = 0.0
+    gens_without_improvement = 0
+    hall_of_fame = []
+
+    n_workers = max(1, mp.cpu_count() - 1)
+
+    print("=" * 65)
+    print("  NEAT — Evolving Pong AI Topology")
+    print("  CONSTRAINED: shapes must fit in {} bytes NVM".format(NVM_MAX_BYTES))
+    print("  Population: {}  Max generations: {}".format(pop_size, generations))
+    print("  Early stop after {} gens without improvement".format(stagnation_limit))
+    print("  Parallel workers: {}".format(n_workers))
+    print()
+    print("  Max single hidden layer: [6, 8, 1] (235 bytes)")
+    print("  Max two hidden layers:   [6, 5, 4, 1] (248 bytes)")
+    print("=" * 65)
+    print()
+
+    total_start = time.time()
+    pool = mp.Pool(processes=n_workers)
+
+    try:
+        for gen in range(generations):
+            t0 = time.time()
+
+            evaluate_population(population, pool)
+
+            population.sort(key=lambda g: g.fitness, reverse=True)
+            gen_best = population[0]
+
+            if gen_best.fitness > best_fitness_ever:
+                best_fitness_ever = gen_best.fitness
+                best_ever = deepcopy(gen_best)
+                gens_without_improvement = 0
+            else:
+                gens_without_improvement += 1
+
+            for g in population[:3]:
+                shape = tuple(g.get_dense_shape())
+                existing = [tuple(hg.get_dense_shape()) for _, hg in hall_of_fame]
+                if shape not in existing:
+                    hall_of_fame.append((g.fitness, deepcopy(g)))
+            hall_of_fame.sort(key=lambda x: x[0], reverse=True)
+            hall_of_fame = hall_of_fame[:10]
+
+            shape, n_hidden, n_conn = gen_best.get_shape_summary()
+            dense = gen_best.get_dense_shape()
+            nvm_used = nvm_bytes_for_genome(gen_best)
+            avg_fitness = sum(g.fitness for g in population) / len(population)
+
+            elapsed = time.time() - t0
+            print("Gen {:>3} | best: {:>6.1f}  avg: {:>5.1f} | {} ({}B) h:{} c:{} | {:.1f}s".format(
+                gen + 1, gen_best.fitness, avg_fitness, dense,
+                nvm_used, n_hidden, n_conn, elapsed))
+
+            if gens_without_improvement >= stagnation_limit:
+                print()
+                print("Early stop: no improvement for {} generations.".format(
+                    stagnation_limit))
+                break
+
+            # Speciate
+            new_species = []
+            for g in population:
+                placed = False
+                for sp in new_species:
+                    if sp.is_compatible(g):
+                        sp.members.append(g)
+                        placed = True
+                        break
+                if not placed:
+                    new_species.append(Species(g))
+
+            for sp in new_species:
+                sp_best = max(m.fitness for m in sp.members)
+                matched = False
+                for old_sp in species_list:
+                    if old_sp.is_compatible(sp.representative):
+                        if sp_best > old_sp.best_fitness:
+                            sp.stagnation = 0
+                        else:
+                            sp.stagnation = old_sp.stagnation + 1
+                        sp.best_fitness = max(sp_best, old_sp.best_fitness)
+                        matched = True
+                        break
+                if not matched:
+                    sp.best_fitness = sp_best
+                    sp.stagnation = 0
+
+            species_list = new_species
+
+            if len(species_list) > 2:
+                species_list = [sp for sp in species_list if sp.stagnation < 15]
+                if len(species_list) < 2:
+                    species_list = new_species[:2]
+
+            total_fitness = sum(
+                max(0, sum(m.fitness for m in sp.members) / len(sp.members))
+                for sp in species_list
+            )
+
+            new_population = []
+
+            for sp in species_list:
+                sp.members.sort(key=lambda g: g.fitness, reverse=True)
+                elite = deepcopy(sp.members[0])
+                elite._fitness_valid = True
+                new_population.append(elite)
+
+            while len(new_population) < pop_size:
+                if total_fitness > 0:
+                    r = random.uniform(0, total_fitness)
+                    cumulative = 0
+                    chosen_sp = species_list[0]
+                    for sp in species_list:
+                        cumulative += max(0, sum(m.fitness for m in sp.members) / len(sp.members))
+                        if cumulative >= r:
+                            chosen_sp = sp
+                            break
+                else:
+                    chosen_sp = random.choice(species_list)
+
+                members = chosen_sp.members
+                if len(members) >= 2 and random.random() < 0.75:
+                    p1 = random.choice(members[:max(2, len(members) // 2)])
+                    p2 = random.choice(members[:max(2, len(members) // 2)])
+                    if p1.fitness >= p2.fitness:
+                        child = crossover(p1, p2, tracker)
+                    else:
+                        child = crossover(p2, p1, tracker)
+                else:
+                    child = deepcopy(random.choice(members))
+
+                child.mutate()
+                new_population.append(child)
+
+            population = new_population
+
+            for sp in species_list:
+                sp.representative = random.choice(sp.members)
+                sp.members = []
+
+    finally:
+        pool.close()
+        pool.join()
+
+    total_time = time.time() - total_start
+
+    # ================================================================ #
+    #  Final validation
+    # ================================================================ #
+
+    print()
+    print("=" * 65)
+    print("  FINAL VALIDATION")
+    print("  Re-evaluating top {} candidates (20 games each)...".format(
+        len(hall_of_fame)))
+    print("=" * 65)
+    print()
+
+    validated = []
+
+    for i, (evo_fitness, genome) in enumerate(hall_of_fame):
+        hits, misses = _evaluate_thorough(genome)
+        dense = genome.get_dense_shape()
+        nvm_used = nvm_bytes_for_genome(genome)
+        params = sum(dense[j] * dense[j+1] + dense[j+1]
+                     for j in range(len(dense) - 1))
+        hit_rate = hits / max(hits + misses, 1) * 100
+
+        validated.append({
+            "genome": genome,
+            "dense_shape": dense,
+            "params": params,
+            "nvm_bytes": nvm_used,
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": hit_rate,
+        })
+
+        print("  {:>2}. {}  params:{:>3}  {}B  hits:{:>4}  miss:{:>3}  rate:{:.0f}%".format(
+            i + 1, dense, params, nvm_used, hits, misses, hit_rate))
+
+    validated.sort(key=lambda v: (v["hits"], -v["params"]), reverse=True)
+
+    print()
+    print("=" * 65)
+    print("  RESULTS (sorted by validated performance)")
+    print("=" * 65)
+    print()
+
+    for i, v in enumerate(validated):
+        marker = " <<<" if i == 0 else ""
+        print("  {:>2}. {}  params:{}  {}B  hits:{}  rate:{:.0f}%{}".format(
+            i + 1, v["dense_shape"], v["params"], v["nvm_bytes"],
+            v["hits"], v["hit_rate"], marker))
+
+    best = validated[0]
+
+    print()
+    print("=" * 65)
+    print("  BEST SHAPE FOR CLUE (fits in {} byte NVM)".format(NVM_MAX_BYTES))
+    print("=" * 65)
+    print()
+    print("  shape = {}".format(best["dense_shape"]))
+    print("  Parameters: {}".format(best["params"]))
+    print("  NVM usage: {} / {} bytes".format(best["nvm_bytes"], NVM_MAX_BYTES))
+    print("  Validated: {} hits, {} misses ({:.0f}% hit rate)".format(
+        best["hits"], best["misses"], best["hit_rate"]))
+    print()
+    print("  Use in your game:")
+    print("    ai_top = AIPaddle(difficulty=0.7, side='top', shape={})".format(
+        best["dense_shape"]))
+    print()
+    print("Total time: {:.0f}s ({:.1f} min)".format(total_time, total_time / 60))
+    print("Done.")
+
+
+if __name__ == "__main__":
+    run_neat()
