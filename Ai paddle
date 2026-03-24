@@ -1,19 +1,28 @@
 import random
+import math
 import struct
 
 S = 240
 HW = 30
 INV_S = 1.0 / 240.0
 N_INP = 6
-N_HID = 9
-N_W0 = 54  # 6*9
-NVM_SZ = 7 + 73 * 4  # 7 header + 73 params * 4 bytes = 299
-MAXH = 30
+N_HID = 6
+N_ACT = 3
+N_W0 = 36  # 6*6
+N_W1 = 18  # 6*3
+N_PARAMS = 36 + 6 + 18 + 3  # 63
+NVM_SZ = 7 + N_PARAMS * 4  # 259
 PADDLE_SPEED = 2.0
 BALL_SPEED_INC = 0.04
 BALL_SPEED_MAX = 2.0
 
-import math
+BUFFER_SIZE = 200
+GAMMA = 0.99
+LR = 0.1
+EPSILON_START = 1.0
+EPSILON_END = 0.1
+EPSILON_DECAY = 500
+TARGET_UPDATE = 100
 
 def _sig(x):
     if x > 10.0: x = 10.0
@@ -21,153 +30,163 @@ def _sig(x):
     return 1.0 / (1.0 + math.exp(-x))
 
 
-class NeuralNetwork:
+class DQN:
 
-    def __init__(self, lr=0.35, mu=0.9):
-        self.lr = lr
-        self.mu = mu
-        l0 = 0.4082  # 1/sqrt(6)
-        l1 = 0.3333  # 1/sqrt(9)
+    def __init__(self):
+        l0 = 1.0 / math.sqrt(N_INP)
+        l1 = 1.0 / math.sqrt(N_HID)
         self.w0 = [random.uniform(-l0, l0) for _ in range(N_W0)]
         self.b0 = [0.0] * N_HID
-        self.w1 = [random.uniform(-l1, l1) for _ in range(N_HID)]
-        self.b1 = 0.0
-        self.vw0 = [0.0] * N_W0
-        self.vb0 = [0.0] * N_HID
-        self.vw1 = [0.0] * N_HID
-        self.vb1 = 0.0
+        self.w1 = [random.uniform(-l1, l1) for _ in range(N_W1)]
+        self.b1 = [0.0] * N_ACT
         self.h = [0.0] * N_HID
-        self.out = 0.0
+        self.q = [0.0] * N_ACT
 
     def forward(self, x):
-        w0 = self.w0; b0 = self.b0; w1 = self.w1; h = self.h
+        w0 = self.w0; b0 = self.b0; w1 = self.w1; b1 = self.b1
+        h = self.h; q = self.q
         for i in range(N_HID):
-            k = i * N_INP
-            h[i] = _sig(b0[i] + w0[k]*x[0] + w0[k+1]*x[1] + w0[k+2]*x[2]
-                        + w0[k+3]*x[3] + w0[k+4]*x[4] + w0[k+5]*x[5])
-        self.out = _sig(self.b1 + w1[0]*h[0] + w1[1]*h[1] + w1[2]*h[2]
-                        + w1[3]*h[3] + w1[4]*h[4] + w1[5]*h[5]
-                        + w1[6]*h[6] + w1[7]*h[7] + w1[8]*h[8])
-        return self.out
+            k = i * N_INP; s = b0[i]
+            for j in range(N_INP): s += w0[k + j] * x[j]
+            h[i] = _sig(s)
+        for i in range(N_ACT):
+            k = i * N_HID; s = b1[i]
+            for j in range(N_HID): s += w1[k + j] * h[j]
+            q[i] = s
+        return q
 
-    def train(self, x, target, lr_scale=1.0):
+    def train_on(self, x, target_q, action):
         self.forward(x)
-        o = self.out; h = self.h
-        w0 = self.w0; b0 = self.b0; w1 = self.w1
-        vw0 = self.vw0; vb0 = self.vb0; vw1 = self.vw1
-        slr = self.lr * lr_scale
-        mu = self.mu
-        do = (target - o) * o * (1.0 - o)
-        slr_do = slr * do
-        for i in range(N_HID):
-            hi = h[i]
-            dh = do * w1[i] * hi * (1.0 - hi)
-            vw1[i] = mu * vw1[i] + slr_do * hi
-            w1[i] += vw1[i]
-            if w1[i] > 3.0: w1[i] = 3.0; vw1[i] = 0.0
-            elif w1[i] < -3.0: w1[i] = -3.0; vw1[i] = 0.0
-            slr_dh = slr * dh
-            k = i * N_INP
-            for j in range(N_INP):
-                vw0[k+j] = mu * vw0[k+j] + slr_dh * x[j]
-                w0[k+j] += vw0[k+j]
-                if w0[k+j] > 3.0: w0[k+j] = 3.0; vw0[k+j] = 0.0
-                elif w0[k+j] < -3.0: w0[k+j] = -3.0; vw0[k+j] = 0.0
-            vb0[i] = mu * vb0[i] + slr_dh
-            b0[i] += vb0[i]
-            if b0[i] > 3.0: b0[i] = 3.0; vb0[i] = 0.0
-            elif b0[i] < -3.0: b0[i] = -3.0; vb0[i] = 0.0
-        self.vb1 = mu * self.vb1 + slr_do
-        self.b1 += self.vb1
-        if self.b1 > 3.0: self.b1 = 3.0; self.vb1 = 0.0
-        elif self.b1 < -3.0: self.b1 = -3.0; self.vb1 = 0.0
+        h = self.h; q = self.q
+        w0 = self.w0; b0 = self.b0; w1 = self.w1; b1 = self.b1
+        e = target_q - q[action]
+        k = action * N_HID
+        for j in range(N_HID):
+            w1[k + j] += LR * e * h[j]
+        b1[action] += LR * e
+        for j in range(N_HID):
+            err = e * w1[action * N_HID + j]
+            dh = err * h[j] * (1.0 - h[j])
+            kk = j * N_INP
+            for m in range(N_INP):
+                w0[kk + m] += LR * dh * x[m]
+            b0[j] += LR * dh
+        return abs(e)
+
+    def copy_from(self, other):
+        self.w0 = list(other.w0); self.b0 = list(other.b0)
+        self.w1 = list(other.w1); self.b1 = list(other.b1)
 
     def save(self):
         import microcontroller
         nvm = microcontroller.nvm
-        n_params = N_W0 + N_HID + N_HID + 1  # 45+9+9+1 = 64
-        sz = 7 + n_params * 4
+        sz = NVM_SZ
         buf = bytearray(sz)
-        buf[0] = 0xAB; buf[1] = 3
-        buf[2] = N_INP; buf[3] = N_HID; buf[4] = 1
-        struct.pack_into("<H", buf, 5, n_params)
+        buf[0] = 0xBB; buf[1] = 3
+        buf[2] = N_INP; buf[3] = N_HID; buf[4] = N_ACT
+        struct.pack_into("<H", buf, 5, N_PARAMS)
         off = 7
-        for v in self.w0:
-            struct.pack_into("<f", buf, off, v); off += 4
-        for v in self.b0:
-            struct.pack_into("<f", buf, off, v); off += 4
-        for v in self.w1:
-            struct.pack_into("<f", buf, off, v); off += 4
-        struct.pack_into("<f", buf, off, self.b1)
-        for i in range(sz):
-            nvm[i] = buf[i]
-        print("Saved", n_params, "weights")
+        for v in self.w0: struct.pack_into("<f", buf, off, v); off += 4
+        for v in self.b0: struct.pack_into("<f", buf, off, v); off += 4
+        for v in self.w1: struct.pack_into("<f", buf, off, v); off += 4
+        for v in self.b1: struct.pack_into("<f", buf, off, v); off += 4
+        for i in range(sz): nvm[i] = buf[i]
+        print("Saved DQN", N_PARAMS, "params")
 
     def load(self):
         import microcontroller
         nvm = microcontroller.nvm
-        if nvm[0] != 0xAB:
-            print("No saved weights"); return False
-        if nvm[1] != 3 or nvm[2] != N_INP or nvm[3] != N_HID or nvm[4] != 1:
+        if nvm[0] != 0xBB:
+            print("No DQN weights"); return False
+        if nvm[2] != N_INP or nvm[3] != N_HID or nvm[4] != N_ACT:
             print("Shape mismatch"); return False
-        n_params = N_W0 + N_HID + N_HID + 1
-        sz = 7 + n_params * 4
+        sz = NVM_SZ
         raw = bytearray(sz)
-        for i in range(sz):
-            raw[i] = nvm[i]
+        for i in range(sz): raw[i] = nvm[i]
         off = 7
-        for i in range(N_W0):
-            self.w0[i] = struct.unpack_from("<f", raw, off)[0]; off += 4
-        for i in range(N_HID):
-            self.b0[i] = struct.unpack_from("<f", raw, off)[0]; off += 4
-        for i in range(N_HID):
-            self.w1[i] = struct.unpack_from("<f", raw, off)[0]; off += 4
-        self.b1 = struct.unpack_from("<f", raw, off)[0]
-        print("Loaded weights"); return True
+        for i in range(N_W0): self.w0[i] = struct.unpack_from("<f", raw, off)[0]; off += 4
+        for i in range(N_HID): self.b0[i] = struct.unpack_from("<f", raw, off)[0]; off += 4
+        for i in range(N_W1): self.w1[i] = struct.unpack_from("<f", raw, off)[0]; off += 4
+        for i in range(N_ACT): self.b1[i] = struct.unpack_from("<f", raw, off)[0]; off += 4
+        print("Loaded DQN weights"); return True
 
-    def param_count(self):
-        return N_W0 + N_HID + N_HID + 1
+
+class PrioritisedReplayBuffer:
+    """Schaul et al. (2016) — samples transitions with highest TD error."""
+
+    def __init__(self):
+        self._buf = [[0.0] * 16 for _ in range(BUFFER_SIZE)]
+        self._len = 0
+        self._pos = 0
+
+    def push(self, s, a, r, ns, done):
+        b = self._buf[self._pos]
+        for i in range(N_INP): b[i] = s[i]
+        b[6] = float(a); b[7] = r
+        for i in range(N_INP): b[8 + i] = ns[i]
+        b[14] = 1.0 if done else 0.0
+        b[15] = 10.0  # high initial priority
+        self._pos += 1
+        if self._pos >= BUFFER_SIZE: self._pos = 0
+        if self._len < BUFFER_SIZE: self._len += 1
+
+    def sample(self):
+        best_idx = 0
+        best_p = self._buf[0][15]
+        for i in range(1, self._len):
+            if self._buf[i][15] > best_p:
+                best_p = self._buf[i][15]
+                best_idx = i
+        b = self._buf[best_idx]
+        return best_idx, b[0:6], int(b[6]), b[7], b[8:14], b[14] > 0.5
+
+    def update_priority(self, idx, td_error):
+        self._buf[idx][15] = abs(td_error) + 0.01
+
+    def __len__(self):
+        return self._len
 
 
 class AIPaddle:
 
     def __init__(self, side="top"):
-        self.nn = NeuralNetwork()
+        self.main_net = DQN()
+        self.target_net = DQN()
+        self.target_net.copy_from(self.main_net)
+        self.replay = PrioritisedReplayBuffer()
         self.side = side
-        self.hits = 0
         self.learning = True
-        self._hbuf = [[0.0]*(N_INP+1) for _ in range(MAXH)]
-        self._hlen = 0
-        self._hpos = 0
-
-    def _push(self, inp, action):
-        if not self.learning: return
-        buf = self._hbuf[self._hpos]
-        for i in range(N_INP):
-            buf[i] = inp[i]
-        buf[N_INP] = action
-        self._hpos += 1
-        if self._hpos >= MAXH: self._hpos = 0
-        if self._hlen < MAXH: self._hlen += 1
+        self.epsilon = EPSILON_START
+        self.steps = 0
+        self.hits = 0
+        self._prev_s = None
+        self._prev_a = None
+        self._pending_reward = 0.0
 
     def update(self, ball, paddle, opp_paddle=None):
         bx = ball.posx; by = ball.posy
         pc = paddle.posx + HW
         opp = (opp_paddle.posx + HW) * INV_S if opp_paddle else 0.5
-        inp = [bx * INV_S, by * INV_S, ball.x_vel, ball.y_vel, pc * INV_S, opp]
+        state = [bx * INV_S, by * INV_S, ball.x_vel, ball.y_vel, pc * INV_S, opp]
 
-        out = self.nn.forward(inp)
-        if self.learning:
-            n2 = 0.40 * (1.0 - self._hlen / MAXH)
-            if n2 > 0.002:
-                out += random.random() * n2 - n2 * 0.5
+        # Store previous transition with accumulated reward
+        if self._prev_s is not None and self.learning:
+            self.replay.push(self._prev_s, self._prev_a, self._pending_reward, state, False)
+            self._train_step()
+        self._pending_reward = 0.0
 
-        if out < 0.45:
-            action = 0.0; paddle.posx -= PADDLE_SPEED
-        elif out > 0.55:
-            action = 1.0; paddle.posx += PADDLE_SPEED
+        # Select action
+        if self.learning and random.random() < self.epsilon:
+            action = random.randint(0, 2)
         else:
-            action = 0.5
+            q = self.main_net.forward(state)
+            action = 0
+            if q[1] > q[action]: action = 1
+            if q[2] > q[action]: action = 2
+
+        # Apply action
+        if action == 0: paddle.posx -= PADDLE_SPEED
+        elif action == 2: paddle.posx += PADDLE_SPEED
 
         px = paddle.posx
         if px < 0: paddle.posx = 0
@@ -175,49 +194,57 @@ class AIPaddle:
         paddle.rect.x = int(paddle.posx)
         paddle.rect.y = int(paddle.posy)
 
-        self._push(inp, action)
-
-        if self.learning:
-            coming = ball.y_vel < 0 if self.side == "top" else ball.y_vel > 0
-            if coming:
-                t = 1.0 if bx > pc else 0.0
-                self.nn.train(inp, t, lr_scale=0.7)
+        self._prev_s = state
+        self._prev_a = action
 
     def on_hit(self):
         self.hits += 1
-        self._reinforce(0.5 + (self.hits if self.hits < 10 else 10) * 0.15)
+        self._pending_reward += 1.0
 
     def on_miss(self, dist=0.0):
         d = dist / (S * 0.5)
         if d > 1.0: d = 1.0
-        self._reinforce(-0.3 - d * 0.7)
+        reward = -3.0 - d * 2.0  # -3 to -5 based on distance
+        if self._prev_s is not None and self.learning:
+            state = self._prev_s  # terminal state loops back
+            self.replay.push(self._prev_s, self._prev_a, reward, state, True)
+            self._train_step()
+        self._prev_s = None
+        self._pending_reward = 0.0
         self.hits = 0
-        self._hlen = 0; self._hpos = 0
 
     def on_opponent_miss(self, dist=0.0):
-        base = 0.3 + (self.hits if self.hits < 10 else 10) * 0.1
-        dist_bonus = dist / (S * 0.5)  # normalise: 0 = close miss, 1 = way off
-        if dist_bonus > 1.0: dist_bonus = 1.0
-        self._reinforce(base + dist_bonus)
+        d = dist / (S * 0.5)
+        if d > 1.0: d = 1.0
+        reward = 3.0 + d * 2.0  # 3 to 5 based on distance
+        if self._prev_s is not None and self.learning:
+            state = self._prev_s
+            self.replay.push(self._prev_s, self._prev_a, reward, state, True)
+            self._train_step()
+        self._prev_s = None
+        self._pending_reward = 0.0
         self.hits = 0
-        self._hlen = 0; self._hpos = 0
 
-    def _reinforce(self, reward):
-        if self._hlen == 0: return
-        lrs = reward if reward > 0 else -reward
-        if lrs > 1.0: lrs = 1.0
-        n = self._hlen
-        start = (self._hpos - n) % MAXH
-        for i in range(n):
-            buf = self._hbuf[(start + i) % MAXH]
-            action = buf[N_INP]
-            if reward > 0:
-                t = action
-            else:
-                if action > 0.5: t = 0.0
-                elif action < 0.5: t = 1.0
-                else: t = 1.0 if buf[0] > buf[4] else 0.0
-            self.nn.train(buf, t, lr_scale=lrs)
+    def _train_step(self):
+        if len(self.replay) < 50: return
+        idx, s, a, r, ns, done = self.replay.sample()
+        if done:
+            target = r
+        else:
+            nq = self.target_net.forward(ns)
+            mx = nq[0]
+            if nq[1] > mx: mx = nq[1]
+            if nq[2] > mx: mx = nq[2]
+            target = r + GAMMA * mx
+        td_error = self.main_net.train_on(s, target, a)
+        self.replay.update_priority(idx, td_error)
+        self.steps += 1
+        if self.epsilon > EPSILON_END:
+            self.epsilon -= (EPSILON_START - EPSILON_END) / EPSILON_DECAY
+        if self.steps % TARGET_UPDATE == 0:
+            self.target_net.copy_from(self.main_net)
 
-    def save(self): self.nn.save()
-    def load(self): self.nn.load()
+    def save(self): self.main_net.save()
+    def load(self):
+        if self.main_net.load():
+            self.target_net.copy_from(self.main_net)
